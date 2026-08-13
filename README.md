@@ -1,4 +1,7 @@
-# ESP32 ThingsBoard with DHT22 Sensor and LED
+# ESP32-CAM ThingsBoard (Wokwi + PlatformIO) — bootstrap
+
+> 🔁 This repository is bootstrapped from [`rch-goldsnaker/esp32-thingsboard-platformio-wokwi`](https://github.com/rch-goldsnaker/esp32-thingsboard-platformio-wokwi).
+> The first commit keeps the original ESP32 + DHT22 + LED template as a baseline; subsequent commits will adapt it to an **ESP32-CAM** workflow (camera stream / capture over ThingsBoard).
 
 This project is a **basic template** for ESP32 that integrates a DHT22 temperature/humidity sensor and a controllable LED, all simulated in **Wokwi** and connected to **ThingsBoard** for IoT.
 
