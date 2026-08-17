@@ -1,0 +1,8 @@
+{
+    "name": "NativeHttpClient",
+    "version": "1.0.0",
+    "description": "ESP32 core HTTPClient renamed to avoid case-insensitive collision with ArduinoHttpClient",
+    "keywords": "http, client, esp32",
+    "frameworks": ["arduino"],
+    "platforms": ["espressif32"]
+}

@@ -1,245 +1,241 @@
-#if defined(ESP8266)
-#include <ESP8266WiFi.h>
-#define THINGSBOARD_ENABLE_PROGMEM 0
-#elif defined(ESP32) || defined(RASPBERRYPI_PICO) || defined(RASPBERRYPI_PICO_W)
 #include <WiFi.h>
-#endif
-
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 99
-#endif
 
 #include <Arduino_MQTT_Client.h>
 #include <Server_Side_RPC.h>
-#include <Attribute_Request.h>
 #include <Shared_Attribute_Update.h>
+#include <Attribute_Request.h>
 #include <ThingsBoard.h>
+#include <Telemetry.h>
+#include <array>
 
-// --------- NEW: Library for DHT sensor ---------
-#include <DHT.h>
+#include "secrets.h"
+#include "config_keys.h"
+#include "camera_pins.h"
+#include "camera_module.h"
+#include "stream_client.h"
+#include "tb_callbacks.h"
+#include <esp_psram.h>
+#include <esp_heap_caps.h>
 
-// --------- NEW: Pins for sensor and external LED ---------
-#define DHTPIN 4        // Pin where the DHT22 is connected
-#define DHTTYPE DHT22   // Sensor type
-#define LED_PIN 2       // Pin for external LED
+const char WIFI_SSID[]         = WIFI_SSID_TXT;
+const char WIFI_PASSWORD[]     = WIFI_PASSWORD_TXT;
+const char TOKEN[]             = TB_TOKEN_TXT;
+constexpr char TB_SERVER[]      = "thingsboard.cloud";
+constexpr uint16_t TB_PORT      = 1883U;
 
-// --------- NEW: Create DHT object ---------
-DHT dht(DHTPIN, DHTTYPE);
+constexpr uint32_t SERIAL_DEBUG_BAUD    = 115200U;
+constexpr uint16_t TELEMETRY_INTERVAL   = 2000U;
+constexpr uint16_t TELEMETRY_SLOW_INTERVAL = 10000U;
+constexpr size_t MAX_ATTRIBUTES         = 10U;
+constexpr uint64_t ATTR_REQUEST_TIMEOUT = 5000ULL * 1000ULL;
 
-constexpr char WIFI_SSID[] = "Wokwi-GUEST";
-constexpr char WIFI_PASSWORD[] = "";
-constexpr char TOKEN[] = "iAJldkfvCKwcvwUQsHnj";
-constexpr char THINGSBOARD_SERVER[] = "thingsboard.cloud";
-constexpr uint16_t THINGSBOARD_PORT = 1883U;
-constexpr uint32_t MAX_MESSAGE_SIZE = 1024U;
-constexpr uint32_t SERIAL_DEBUG_BAUD = 115200U;
-constexpr size_t MAX_ATTRIBUTES = 3U;
-constexpr uint64_t REQUEST_TIMEOUT_MICROSECONDS = 5000U * 1000U;
+volatile bool streamEnabled = false;
+volatile uint16_t streamFps = 5;
+volatile bool flashState    = false;
 
-constexpr const char BLINKING_INTERVAL_ATTR[] = "blinkingInterval";
-constexpr const char LED_MODE_ATTR[] = "ledMode";
-constexpr const char LED_STATE_ATTR[] = "ledState";
+uint32_t lastFrameMs    = 0;
+uint32_t lastTelemetryMs = 0;
+uint32_t lastSlowTelemetryMs = 0;
 
 WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
-Server_Side_RPC<3U, 5U> rpc;
-Attribute_Request<2U, MAX_ATTRIBUTES> attr_request;
-Shared_Attribute_Update<3U, MAX_ATTRIBUTES> shared_update;
+CameraModule camera;
+StreamClient streamer;
+
+Server_Side_RPC<4U, 5U> rpc;
+Attribute_Request<2U, MAX_ATTRIBUTES> attrRequest;
+Shared_Attribute_Update<3U, MAX_ATTRIBUTES> sharedUpdate;
 
 const std::array<IAPI_Implementation*, 3U> apis = {
-    &rpc,
-    &attr_request,
-    &shared_update
+  &rpc,
+  &attrRequest,
+  &sharedUpdate
 };
 
-ThingsBoard tb(mqttClient, MAX_MESSAGE_SIZE, Default_Max_Stack_Size, apis);
+ThingsBoardSized<32U> tb(mqttClient, 1024U, Default_Max_Stack_Size, apis);
 
-volatile bool attributesChanged = false;
-volatile int ledMode = 0;
-volatile bool ledState = false;
-constexpr uint16_t BLINKING_INTERVAL_MS_MIN = 10U;
-constexpr uint16_t BLINKING_INTERVAL_MS_MAX = 60000U;
-volatile uint16_t blinkingInterval = 1000U;
+const Shared_Attribute_Callback<MAX_ATTRIBUTES> sharedAttrCallback(
+  &processSharedAttributes,
+  getSharedAttributesList().cbegin(),
+  getSharedAttributesList().cend()
+);
 
-uint32_t previousStateChange;
-constexpr int16_t telemetrySendInterval = 2000U;
-uint32_t previousDataSend;
+const Attribute_Request_Callback<MAX_ATTRIBUTES> sharedAttrRequestCallback(
+  &processSharedAttributes,
+  ATTR_REQUEST_TIMEOUT,
+  &requestTimedOut,
+  getSharedAttributesList()
+);
 
-constexpr std::array<const char *, 2U> SHARED_ATTRIBUTES_LIST = {
-  LED_STATE_ATTR,
-  BLINKING_INTERVAL_ATTR
-};
+void sendStaticMetrics() {
+  std::array<Telemetry, 1U> heap = {
+    Telemetry("heapSize", (int)ESP.getHeapSize())
+  };
+  tb.sendAttributes<1U>(heap.begin(), heap.end());
 
-constexpr std::array<const char *, 1U> CLIENT_ATTRIBUTES_LIST = {
-  LED_MODE_ATTR
-};
+  if (psramFound()) {
+    std::array<Telemetry, 1U> psram = {
+      Telemetry("psramTotal", (int)esp_psram_get_size())
+    };
+    tb.sendAttributes<1U>(psram.begin(), psram.end());
+  }
+}
 
-void InitWiFi() {
-  Serial.println("Connecting to AP ...");
+void initWiFi() {
+  Serial.print("[BOOT] Connecting to AP: ");
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
+
+  uint8_t attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
     delay(500);
     Serial.print(".");
+    attempts++;
   }
-  Serial.println("Connected to AP");
+  if (WiFi.status() == WL_CONNECTED) {
+    WiFi.setSleep(false);
+    Serial.println();
+    Serial.println("[BOOT] Connected to AP");
+    Serial.println("[BOOT] WiFi sleep disabled");
+    Serial.print("[BOOT] IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println();
+    Serial.println("[BOOT] WiFi timeout, continuing");
+  }
 }
 
-const bool reconnect() {
-  const wl_status_t status = WiFi.status();
-  if (status == WL_CONNECTED) {
-    return true;
-  }
-  InitWiFi();
-  return true;
-}
-
-void processSetLedMode(const JsonVariantConst &data, JsonDocument &response) {
-  Serial.println("Received the set led state RPC method");
-  int new_mode = data;
-  Serial.print("Mode to change: ");
-  Serial.println(new_mode);
-  StaticJsonDocument<1> response_doc;
-  if (new_mode != 0 && new_mode != 1) {
-    response_doc["error"] = "Unknown mode!";
-    response.set(response_doc);
+void connectThingsBoard() {
+  Serial.print("[TB] Connecting to: ");
+  Serial.print(TB_SERVER);
+  Serial.print(":");
+  Serial.println(TB_PORT);
+  if (!tb.connect(TB_SERVER, TOKEN, TB_PORT)) {
+    Serial.println("[TB] Failed to connect");
     return;
   }
-  ledMode = new_mode;
-  attributesChanged = true;
-  response_doc["newMode"] = (int)ledMode;
-  response.set(response_doc);
-}
-
-const std::array<RPC_Callback, 1U> callbacks = {
-  RPC_Callback{ "setLedMode", processSetLedMode }
-};
-
-void processSharedAttributes(const JsonObjectConst &data) {
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    if (strcmp(it->key().c_str(), BLINKING_INTERVAL_ATTR) == 0) {
-      const uint16_t new_interval = it->value().as<uint16_t>();
-      if (new_interval >= BLINKING_INTERVAL_MS_MIN && new_interval <= BLINKING_INTERVAL_MS_MAX) {
-        blinkingInterval = new_interval;
-        Serial.print("Blinking interval is set to: ");
-        Serial.println(new_interval);
-      }
-    } else if (strcmp(it->key().c_str(), LED_STATE_ATTR) == 0) {
-      ledState = it->value().as<bool>();
-      // --------- MODIFIED: now using LED_PIN instead of LED_BUILTIN ---------
-      digitalWrite(LED_PIN, ledState);
-      Serial.print("LED state is set to: ");
-      Serial.println(ledState);
+  tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
+  sendStaticMetrics();
+  if (!isSubscriptionsActive()) {
+    if (!rpc.RPC_Subscribe(getRpcCallbacks().cbegin(), getRpcCallbacks().cend())) {
+      Serial.println("[TB] RPC subscribe failed");
+      return;
     }
-  }
-  attributesChanged = true;
-}
-
-void processClientAttributes(const JsonObjectConst &data) {
-  for (auto it = data.begin(); it != data.end(); ++it) {
-    if (strcmp(it->key().c_str(), LED_MODE_ATTR) == 0) {
-      const uint16_t new_mode = it->value().as<uint16_t>();
-      ledMode = new_mode;
+    if (!sharedUpdate.Shared_Attributes_Subscribe(sharedAttrCallback)) {
+      Serial.println("[TB] shared attributes subscribe failed");
+      return;
     }
+    resetStreamUrlReceived();
+    if (!attrRequest.Shared_Attributes_Request(sharedAttrRequestCallback)) {
+      Serial.println("[TB] shared attributes request failed");
+      return;
+    }
+    setSubscriptionsActive();
+    Serial.println("[TB] Subscribe done");
   }
 }
-
-void requestTimedOut() {
-  Serial.printf("Attribute request timed out, did not receive a response in (%llu) microseconds.\n", REQUEST_TIMEOUT_MICROSECONDS);
-}
-
-const Shared_Attribute_Callback<MAX_ATTRIBUTES> attributes_callback(&processSharedAttributes, SHARED_ATTRIBUTES_LIST.cbegin(), SHARED_ATTRIBUTES_LIST.cend());
-const Attribute_Request_Callback<MAX_ATTRIBUTES> attribute_shared_request_callback(&processSharedAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, SHARED_ATTRIBUTES_LIST);
-const Attribute_Request_Callback<MAX_ATTRIBUTES> attribute_client_request_callback(&processClientAttributes, REQUEST_TIMEOUT_MICROSECONDS, &requestTimedOut, CLIENT_ATTRIBUTES_LIST);
 
 void setup() {
   Serial.begin(SERIAL_DEBUG_BAUD);
+  delay(200);
+  Serial.println("\n=========================");
+  Serial.println("[BOOT] ESP32-CAM starting");
+  Serial.print("[BOOT] Baud: ");
+  Serial.println(SERIAL_DEBUG_BAUD);
 
-  // --------- MODIFIED: initialize external LED and DHT22 ---------
-  pinMode(LED_PIN, OUTPUT);
-  dht.begin();
+  bindCallbacksGlobals(&tb, &camera, &streamer);
 
-  delay(1000);
-  InitWiFi();
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);
+
+  initWiFi();
+
+  if (!camera.begin()) {
+    Serial.println("[CAM] init FAILED - continuing without camera");
+  }
+
+  streamer.begin("");
+
+  Serial.println("[STREAM] Waiting for streamUrl from ThingsBoard shared attributes...");
 }
 
 void loop() {
-  delay(10);
-
-  if (!reconnect()) {
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t lastWifiReconnectMs = 0;
+    static uint8_t wifiAttempt = 0;
+    uint32_t now = millis();
+    uint32_t interval = min((uint32_t)30000U, (uint32_t)(5000U * (wifiAttempt + 1)));
+    if (now - lastWifiReconnectMs < interval) return;
+    lastWifiReconnectMs = now;
+    wifiAttempt++;
+    if (wifiAttempt > 6) wifiAttempt = 6;
+    initWiFi();
+    if (WiFi.status() == WL_CONNECTED) wifiAttempt = 0;
     return;
   }
 
   if (!tb.connected()) {
-    Serial.print("Connecting to: ");
-    Serial.print(THINGSBOARD_SERVER);
-    Serial.print(" with token ");
-    Serial.println(TOKEN);
-    if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
-      Serial.println("Failed to connect");
-      return;
-    }
-    tb.sendAttributeData("macAddress", WiFi.macAddress().c_str());
-    Serial.println("Subscribing for RPC...");
-    if (!rpc.RPC_Subscribe(callbacks.cbegin(), callbacks.cend())) {
-      Serial.println("Failed to subscribe for RPC");
-      return;
-    }
-    if (!shared_update.Shared_Attributes_Subscribe(attributes_callback)) {
-      Serial.println("Failed to subscribe for shared attribute updates");
-      return;
-    }
-    Serial.println("Subscribe done");
-    if (!attr_request.Shared_Attributes_Request(attribute_shared_request_callback)) {
-      Serial.println("Failed to request for shared attributes");
-      return;
-    }
-    if (!attr_request.Client_Attributes_Request(attribute_client_request_callback)) {
-      Serial.println("Failed to request for client attributes");
-      return;
-    }
-  }
-
-  if (attributesChanged) {
-    attributesChanged = false;
-    if (ledMode == 0) {
-      previousStateChange = millis();
-    }
-    tb.sendTelemetryData(LED_MODE_ATTR, ledMode);
-    tb.sendTelemetryData(LED_STATE_ATTR, ledState);
-    tb.sendAttributeData(LED_MODE_ATTR, ledMode);
-    tb.sendAttributeData(LED_STATE_ATTR, ledState);
-  }
-
-  if (ledMode == 1 && millis() - previousStateChange > blinkingInterval) {
-    previousStateChange = millis();
-    ledState = !ledState;
-    tb.sendTelemetryData(LED_STATE_ATTR, ledState);
-    tb.sendAttributeData(LED_STATE_ATTR, ledState);
-
-    // --------- MODIFIED: external LED instead of LED_BUILTIN ---------
-    digitalWrite(LED_PIN, ledState);
-  }
-
-  if (millis() - previousDataSend > telemetrySendInterval) {
-    previousDataSend = millis();
-
-    // --------- MODIFIED: use real DHT22 data ---------
-    float temperature = dht.readTemperature();
-    float humidity = dht.readHumidity();
-
-    if (!isnan(temperature) && !isnan(humidity)) {
-      tb.sendTelemetryData("temperature", temperature);
-      tb.sendTelemetryData("humidity", humidity);
-    } else {
-      Serial.println("Failed to read from DHT sensor!");
-    }
-
-    tb.sendAttributeData("rssi", WiFi.RSSI());
-    tb.sendAttributeData("channel", WiFi.channel());
-    tb.sendAttributeData("bssid", WiFi.BSSIDstr().c_str());
-    tb.sendAttributeData("localIp", WiFi.localIP().toString().c_str());
-    tb.sendAttributeData("ssid", WiFi.SSID().c_str());
+    static uint32_t lastReconnectMs = 0;
+    uint32_t now = millis();
+    if (now - lastReconnectMs < 5000) return;
+    lastReconnectMs = now;
+    connectThingsBoard();
   }
 
   tb.loop();
+
+  uint32_t now = millis();
+
+  if (streamEnabled && camera.isReady() && isStreamUrlFromShared()) {
+    if (!isStreamInBackoff()) {
+      uint16_t fps = max((uint16_t)1, (uint16_t)streamFps);
+      uint32_t periodMs = 1000UL / fps;
+      if (now - lastFrameMs > periodMs) {
+        lastFrameMs = now;
+        const uint8_t* buf = nullptr;
+        size_t len = 0;
+        if (camera.captureJpeg(&buf, &len)) {
+          if (!streamer.sendFrame(buf, len, FrameSource::Stream)) {
+            markStreamFailed();
+            Serial.printf("[STREAM] fail backoff 5s (total=%lu)\n", streamer.getFailures());
+          }
+          camera.releaseFrameBuffer();
+        }
+      }
+    }
+  }
+
+  if (now - lastTelemetryMs > TELEMETRY_INTERVAL) {
+    lastTelemetryMs = now;
+    std::array<Telemetry, 2U> fast = {
+      Telemetry("rssi", WiFi.RSSI()),
+      Telemetry("streamFailures", (int)streamer.getFailures())
+    };
+    tb.sendAttributes<2U>(fast.begin(), fast.end());
+  }
+
+  if (now - lastSlowTelemetryMs > TELEMETRY_SLOW_INTERVAL) {
+    lastSlowTelemetryMs = now;
+    size_t idx = 0;
+    std::array<Telemetry, 8U> slow = {};
+    slow[idx++] = Telemetry("uptime", (int)(now / 1000));
+    slow[idx++] = Telemetry("streamFramesSent", (int)streamer.getFramesSent());
+    slow[idx++] = Telemetry("freeHeap", (int)ESP.getFreeHeap());
+    slow[idx++] = Telemetry("heapMinFree", (int)heap_caps_get_minimum_free_size(MALLOC_CAP_DMA));
+    if (psramFound()) {
+      size_t psramFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+      size_t psramTotal = esp_psram_get_size();
+      int psramUsedPct = psramTotal > 0 ? (int)((psramTotal - psramFree) * 100 / psramTotal) : 0;
+      slow[idx++] = Telemetry("freePsram", (int)psramFree);
+      slow[idx++] = Telemetry("psramUsedPct", psramUsedPct);
+    }
+    if (camera.isReady()) {
+      slow[idx++] = Telemetry("lastJpegSize", (int)camera.getLastJpegSize());
+      slow[idx++] = Telemetry("cameraReady", true);
+    } else {
+      slow[idx++] = Telemetry("cameraReady", false);
+    }
+    tb.sendAttributes<8U>(slow.begin(), slow.begin() + idx);
+  }
 }
