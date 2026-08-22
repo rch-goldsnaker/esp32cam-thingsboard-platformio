@@ -24,6 +24,7 @@ bool isStreamUrlFromShared();
 void resetStreamUrlReceived();
 bool isSubscriptionsActive();
 void setSubscriptionsActive();
+void clearSubscriptionsActive();
 
 const std::array<RPC_Callback, 4U>& getRpcCallbacks();
 const std::array<const char*, 10U>& getSharedAttributesList();

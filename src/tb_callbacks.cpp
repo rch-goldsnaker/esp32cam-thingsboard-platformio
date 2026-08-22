@@ -35,6 +35,10 @@ void setSubscriptionsActive() {
   subscriptionsActive = true;
 }
 
+void clearSubscriptionsActive() {
+  subscriptionsActive = false;
+}
+
 static bool parseFlashValue(const JsonVariantConst& data) {
   if (data.is<bool>()) return data.as<bool>();
   if (data.is<int>())  return data.as<int>() != 0;

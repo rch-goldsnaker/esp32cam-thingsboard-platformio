@@ -176,6 +176,7 @@ void loop() {
   }
 
   if (!tb.connected()) {
+    clearSubscriptionsActive();
     static uint32_t lastReconnectMs = 0;
     uint32_t now = millis();
     if (now - lastReconnectMs < 5000) return;
